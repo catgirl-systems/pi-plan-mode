@@ -44,6 +44,7 @@ import {
 	setPlanAnnotations,
 	writeComments,
 	clearComments,
+	type PlanEntry,
 } from "./src/plan-store.ts";
 
 // ---------- config ----------
@@ -549,18 +550,13 @@ function commentsPathFor(filePath: string): string {
 
 // ---------- entry points ----------
 
-async function openReader(ctx: ExtensionContext, pi: ExtensionAPI, variant: Variant, target?: string): Promise<void> {
-	const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
-	const plans = await listPlans({ dir });
-	if (plans.length === 0) {
-		ctx.ui.notify("No saved plans yet — plans land in .pi/plans/ when you use plan mode.", "info");
-		return;
-	}
-	const t = target?.trim().toLowerCase();
-	const plan = t
-		? (plans.find((p) => p.fileName.toLowerCase() === t || p.fileName.replace(/\.md$/, "").toLowerCase() === t || p.title.toLowerCase() === t) ?? plans[0]!)
-		: plans[0]!;
-
+async function openReaderOn(
+	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	variant: Variant,
+	dir: string,
+	plan: PlanEntry,
+): Promise<void> {
 	const result = await ctx.ui.custom<ReaderResult>(
 		(tui, theme, _keybindings, done) =>
 			new PlanReader({
@@ -586,6 +582,20 @@ async function openReader(ctx: ExtensionContext, pi: ExtensionAPI, variant: Vari
 	// approve has no meaning in browse variant; cancel: plan file stays saved
 }
 
+async function openReader(ctx: ExtensionContext, pi: ExtensionAPI, variant: Variant, target?: string): Promise<void> {
+	const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
+	const plans = await listPlans({ dir });
+	if (plans.length === 0) {
+		ctx.ui.notify("No saved plans yet — plans land in .pi/plans/ when you use plan mode.", "info");
+		return;
+	}
+	const t = target?.trim().toLowerCase();
+	const plan = t
+		? (plans.find((p) => p.fileName.toLowerCase() === t || p.fileName.replace(/\.md$/, "").toLowerCase() === t || p.title.toLowerCase() === t) ?? plans[0]!)
+		: plans[0]!;
+	await openReaderOn(ctx, pi, variant, dir, plan);
+}
+
 function revisionPrompt(filePath: string, newVersion: number, count: number): string {
 	const comments = commentsPathFor(filePath);
 	return (
@@ -602,11 +612,178 @@ function executePrompt(filePath: string): string {
 	);
 }
 
+// ---------- plans browser ----------
+
+const STATUS_BADGES: Record<PlanEntry["status"], string> = {
+	approved: "✔ approved",
+	"not-implemented": "◌ set aside",
+	pending: "• pending",
+};
+
+function formatRelativeTimeShort(iso: string): string {
+	const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+	if (seconds < 60) return "now";
+	const minutes = seconds / 60;
+	if (minutes < 60) return `${Math.floor(minutes)}m`;
+	const hours = minutes / 60;
+	if (hours < 24) return `${Math.floor(hours)}h`;
+	const days = hours / 24;
+	if (days < 7) return `${Math.floor(days)}d`;
+	return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+class PlansBrowser implements Component {
+	private tui: { requestRender: () => void };
+	private theme: ReaderTheme;
+	private plans: PlanEntry[];
+	private done: (filePath: string | null) => void;
+	private selectedIndex = 0;
+	private query = "";
+	private scrollOffset = 0;
+
+	constructor(opts: {
+		tui: { requestRender: () => void };
+		theme: { fg(color: string, s: string): string; bg(color: string, s: string): string };
+		plans: PlanEntry[];
+		done: (filePath: string | null) => void;
+	}) {
+		this.tui = opts.tui;
+		this.theme = makeTheme(opts.theme);
+		this.plans = opts.plans;
+		this.done = opts.done;
+	}
+
+	private filtered(): PlanEntry[] {
+		const q = this.query.trim().toLowerCase();
+		if (!q) return this.plans;
+		return this.plans.filter((p) => p.title.toLowerCase().includes(q) || p.fileName.toLowerCase().includes(q));
+	}
+
+	private bodyRows(): number {
+		const h = process.stdout.rows ?? 28;
+		return Math.max(3, h - 1 - 9);
+	}
+
+	handleInput(data: string): void {
+		const items = this.filtered();
+		if (matchesKey(data, Key.escape)) {
+			if (this.query) this.query = "";
+			else return this.done(null);
+		} else if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
+			const delta = matchesKey(data, Key.up) ? -1 : 1;
+			this.selectedIndex = Math.min(Math.max(0, this.selectedIndex + delta), Math.max(0, items.length - 1));
+		} else if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
+			const delta = matchesKey(data, Key.pageUp) ? -this.bodyRows() : this.bodyRows();
+			this.selectedIndex = Math.min(Math.max(0, this.selectedIndex + delta), Math.max(0, items.length - 1));
+		} else if (matchesKey(data, Key.enter)) {
+			const pick = items[this.selectedIndex];
+			if (pick) return this.done(pick.filePath);
+		} else if (matchesKey(data, Key.backspace)) {
+			this.query = this.query.slice(0, -1);
+		} else if (isPrintable(data)) {
+			this.query += data;
+			this.selectedIndex = 0;
+		}
+		this.followCursor(items.length);
+		this.tui.requestRender();
+	}
+
+	private followCursor(total: number): void {
+		if (total === 0) return;
+		this.scrollOffset = clampScrollOffset({ row: this.selectedIndex, total, maxVisible: this.bodyRows(), currentOffset: this.scrollOffset });
+	}
+
+	render(width: number): string[] {
+		const out: string[] = [];
+		const items = this.filtered();
+		out.push(truncateToWidth(`${bold(this.theme.accent("Plans"))}${this.theme.dim(` · ${items.length} plan${items.length === 1 ? "" : "s"}`)}`, width));
+		out.push(this.theme.dim(`search: ${this.query}▏`));
+		if (items.length === 0) {
+			out.push(this.theme.dim(this.query ? `No plans match "${this.query}"` : "No plans match"));
+		} else {
+			const start = Math.min(this.scrollOffset, Math.max(0, items.length - this.bodyRows()));
+			for (const [i, plan] of items.slice(start, start + this.bodyRows()).entries()) {
+				const idx = start + i;
+				const selected = idx === this.selectedIndex;
+				const badge = STATUS_BADGES[plan.status];
+				const color = plan.status === "approved" ? "success" : plan.status === "pending" ? "dim" : "warning";
+				const pointer = selected ? this.theme.accent("❯ ") : "  ";
+				const title = selected ? bold(this.theme.accent(plan.title)) : plan.title;
+				const bits = [
+					this.theme[color](badge),
+					...(plan.version && plan.version > 1 ? [this.theme.dim(`v${plan.version}`)] : []),
+					...(plan.annotations.length > 0 ? [this.theme.accent(`${plan.annotations.length} comment${plan.annotations.length === 1 ? "" : "s"}`)] : []),
+					this.theme.dim(formatRelativeTimeShort(plan.updatedAt)),
+				];
+				let line = `${pointer}${title}${this.theme.dim("  ")}${bits.join(this.theme.dim("  "))}`;
+				if (selected) line = this.theme.selected(padTo(line, width));
+				out.push(truncateToWidth(line, width));
+			}
+		}
+		out.push(this.theme.dim(italic(this.query ? "enter to open · esc to clear" : "type to search · ↑/↓ navigate · enter to open · esc to close")));
+		return out;
+	}
+
+	invalidate(): void {}
+}
+
+async function openPlansBrowser(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+	const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
+	const plans = await listPlans({ dir });
+	if (plans.length === 0) {
+		ctx.ui.notify("No saved plans yet — plans land in .pi/plans/ when you use plan mode.", "info");
+		return;
+	}
+	const filePath = await ctx.ui.custom<string | null>(
+		(tui, theme, _keybindings, done) => new PlansBrowser({ tui, theme, plans, done }),
+	);
+	if (!filePath) return;
+	const plans2 = await listPlans({ dir }); // re-list: reader may have changed metadata
+	const plan = plans2.find((p) => p.filePath === filePath) ?? plans[0]!;
+	await openReaderOn(ctx, pi, "browse", dir, plan);
+}
+
+function planRequestPrompt(cwd: string, task: string): string {
+	const dir = defaultPlansDir({ cwd, home: process.env.HOME ?? "" });
+	return (
+		`Plan request: ${task}\n\n` +
+		`Research what's needed (read the code, search — do not implement anything yet), then write an implementation plan ` +
+		`as markdown to ${dir}/<descriptive-name>.md (choose a kebab-case name yourself; the file must be a .md inside that directory). ` +
+		`The plan should be opinionated and actionable: recommended approach only, critical file paths, and a verification section. ` +
+		`When the plan file is written, call the plan_review tool with its absolute path to present it for approval.`
+	);
+}
+
 export default function planReviewExtension(pi: ExtensionAPI): void {
+	registerCommandsAndTools(pi);
+}
+
+function registerCommandsAndTools(pi: ExtensionAPI): void {
+	pi.registerCommand("plan", {
+		description: "Plan a task: research, write .pi/plans/<name>.md, present for review",
+		handler: async (args, ctx) => {
+			const task = args?.trim();
+			if (!task) {
+				ctx.ui.notify("Usage: /plan <task> — research, write a plan, present it for review", "info");
+				return;
+			}
+			const prompt = planRequestPrompt(ctx.cwd, task);
+			if (ctx.isIdle()) pi.sendUserMessage(prompt);
+			else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		},
+	});
+
 	pi.registerCommand("plan-review", {
 		description: "Open the plan review reader (freshest plan in .pi/plans/, or by name/title)",
 		handler: async (args, ctx) => {
 			await openReader(ctx, pi, "browse", args?.trim() || undefined);
+		},
+	});
+
+	pi.registerCommand("plans", {
+		description: "Browse saved plans (.pi/plans/)",
+		handler: async (_args, ctx) => {
+			await openPlansBrowser(ctx, pi as ExtensionAPI);
 		},
 	});
 
