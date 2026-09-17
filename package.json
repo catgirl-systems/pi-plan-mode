@@ -1,0 +1,39 @@
+{
+  "name": "pi-plan-mode",
+  "version": "0.1.0",
+  "description": "Plan review reader for pi — line-addressed plan review with inline comments, version diffing, and an agent revise/re-review loop.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/catgirl-systems/pi-plan-mode.git"
+  },
+  "keywords": ["pi", "pi-extension", "plan-mode", "coding-agent"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc",
+    "test": "tsc && node --experimental-strip-types src/reader-core.check.ts && node --experimental-strip-types src/plan-store.check.ts && node --experimental-strip-types src/reader-smoke.check.ts"
+  },
+  "dependencies": {
+    "open-editor": "^5.1.0",
+    "string-width": "^7.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "@types/node": "^22",
+    "typebox": "^1",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
