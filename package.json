@@ -1,5 +1,5 @@
 {
-  "name": "pi-plan-mode",
+  "name": "@catgirl-systems/pi-plan-mode",
   "version": "0.1.0",
   "description": "Plan review reader for pi — line-addressed plan review with inline comments, version diffing, and an agent revise/re-review loop.",
   "license": "MIT",
@@ -7,10 +7,17 @@
     "type": "git",
     "url": "git+ssh://git@github.com/catgirl-systems/pi-plan-mode.git"
   },
-  "keywords": ["pi", "pi-extension", "plan-mode", "coding-agent"],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "plan-mode",
+    "coding-agent"
+  ],
   "type": "module",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "files": [
     "index.ts",
@@ -35,5 +42,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
