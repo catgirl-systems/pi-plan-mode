@@ -23,6 +23,6 @@ jobs:
         run: npm pkg set version="${GITHUB_REF_NAME#v}"
       - run: npm ci
       - run: npm test
+      # provenance disabled while the repo is private: npm rejects attestations
+      # from non-public source repos. Restore NPM_CONFIG_PROVENANCE: true once public.
       - run: npm publish
-        env:
-          NPM_CONFIG_PROVENANCE: true
