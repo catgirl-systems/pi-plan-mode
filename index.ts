@@ -363,10 +363,17 @@ class PlanReader implements Component, Focusable {
 		this.annotations = annotations;
 		this.rebuildActions();
 		this.rowsEpoch++;
-		void setPlanAnnotations({ filePath: this.filePath, dir: this.dir, annotations }).catch(() => {
-			this.status = "Failed to save comments to disk";
-		});
+		// lastPersist lets tests (and future callers) await the write deterministically
+		this.lastPersist = setPlanAnnotations({ filePath: this.filePath, dir: this.dir, annotations })
+			.then(() => {
+				this.status = null;
+			})
+			.catch(() => {
+				this.status = "Failed to save comments to disk";
+			});
 	}
+
+	lastPersist: Promise<void> = Promise.resolve();
 
 	private followCursor(): void {
 		const all = this.getDisplayRows();

@@ -69,12 +69,13 @@ const stubCtx = {
 		notify: () => {},
 		theme,
 		custom: async (factory: (tui: unknown, theme: unknown, kb: unknown, done: (v: unknown) => void) => unknown) => {
-			const component = factory({ requestRender: () => renders++ }, theme, {}, (v: unknown) => {
+			const component: any = factory({ requestRender: () => renders++ }, theme, {}, (v: unknown) => {
 				result = v as typeof result;
 			});
 			captured.component = component;
 			// wait for async load
-			await new Promise((r) => setTimeout(r, 50));
+			// wait for the async load to settle (load() calls requestRender when done)
+			for (let i = 0; i < 100 && !component.loaded; i++) await new Promise((r) => setTimeout(r, 10));
 			return undefined; // simulating cancel path at the openReader level
 		},
 	},
@@ -103,7 +104,7 @@ const withDraft = reader.render(100);
 assert.ok(withDraft.some((l: string) => l.includes("┃")), "draft input row rendered");
 reader.handleInput("ello"); // finish typing
 reader.handleInput("\r"); // enter pins it
-await new Promise((r) => setTimeout(r, 100)); // persist is async
+await reader.lastPersist; // persist is async — await the write itself
 
 const annCheck = await listPlans({ dir: join(dir, ".pi", "plans") });
 assert.equal(annCheck[0]!.annotations.length, 1, "annotation persisted to index");
@@ -112,7 +113,7 @@ assert.equal(annCheck[0]!.annotations[0]!.text, "hello");
 // quick comment: '?' pins instantly
 reader.handleInput(down); // next line
 reader.handleInput("?");
-await new Promise((r) => setTimeout(r, 100));
+await reader.lastPersist;
 const afterQuick = await listPlans({ dir: join(dir, ".pi", "plans") });
 assert.equal(afterQuick[0]!.annotations.length, 2);
 assert.ok(afterQuick[0]!.annotations.some((a) => a.text.startsWith("Why?")));
