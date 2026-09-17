@@ -17,9 +17,10 @@ jobs:
           # node 24 ships npm 11.5+ (required for trusted publishing)
           node-version: 24
           cache: npm
-          registry-url: https://registry.npmjs.org
-      - name: Version from release tag
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version
+          # no registry-url here: it would write a token into .npmrc and
+          # shadow the OIDC credential npm obtains during publish
+      - name: Sync version from release tag
+        run: npm pkg set version="${GITHUB_REF_NAME#v}"
       - run: npm ci
       - run: npm test
       - run: npm publish
