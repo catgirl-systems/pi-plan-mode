@@ -137,5 +137,85 @@ assert.equal(sidecar.length, 2, "sidecar written for the agent");
 const cleared = await listPlans({ dir: join(dir, ".pi", "plans") });
 assert.equal(cleared[0]!.annotations.length, 0, "UI annotations cleared for next round");
 
+
+// ---------- /plan + /plans (fresh registration so handlers are capturable) ----------
+const sent2: string[] = [];
+const notices: string[] = [];
+const cmds: Record<string, { handler: (args: string, ctx: unknown) => Promise<void> }> = {};
+mod.default({
+	registerCommand: (n: string, d: { handler: (args: string, ctx: unknown) => Promise<void> }) => { cmds[n] = d; },
+	registerTool: () => {},
+	registerFlag: () => {},
+	sendUserMessage: (m: string, o?: { deliverAs?: string }) => sent2.push(o ? `${m}|${o.deliverAs}` : m),
+} as never);
+assert.ok(cmds["plan"] && cmds["plans"] && cmds["plan-review"], "commands registered: plan, plans, plan-review");
+
+const idleCtx = {
+	cwd: dir,
+	isIdle: () => true,
+	ui: { notify: (m: string) => notices.push(m), theme, custom: async () => undefined },
+};
+
+// /plan with no args -> usage notice, nothing sent
+await cmds["plan"]!.handler("", idleCtx as never);
+assert.equal(sent2.length, 0, "no-arg /plan sends nothing");
+assert.ok(notices.some((n) => n.includes("Usage: /plan")), "usage notice shown");
+
+// /plan <task> -> contract message: task, plans dir, plan_review tool, no-implement
+await cmds["plan"]!.handler("add rate limiting to the API", idleCtx as never);
+assert.equal(sent2.length, 1);
+assert.ok(sent2[0]!.includes("Plan request: add rate limiting to the API"));
+assert.ok(sent2[0]!.includes(join(dir, ".pi", "plans")));
+assert.ok(sent2[0]!.includes("plan_review"));
+assert.ok(/do not implement/i.test(sent2[0]!), "contract forbids implementing");
+
+// busy agent -> followUp delivery
+const busyCtx = { cwd: dir, isIdle: () => false, ui: idleCtx.ui };
+await cmds["plan"]!.handler("add search", busyCtx as never);
+assert.equal(sent2.length, 2);
+assert.ok(sent2[1]!.endsWith("|followUp"), "busy /plan delivers as followUp");
+
+// ---------- plans browser ----------
+let opened: string | null | undefined;
+let closed: boolean | undefined;
+let browser: any = null;
+const browserCtx = {
+	cwd: dir,
+	isIdle: () => true,
+	ui: {
+		notify: () => {},
+		theme,
+		custom: async (factory: (tui: unknown, theme: unknown, kb: unknown, done: (v: string | null) => void) => unknown) => {
+			browser = factory({ requestRender: () => {} }, theme, {}, (v: string | null) => { opened = v; });
+			return undefined;
+		},
+	},
+};
+await cmds["plans"]!.handler("", browserCtx as never);
+const rows = browser.render(100);
+assert.ok(rows.some((l: string) => l.includes("Plans")), "browser title");
+assert.ok(rows.some((l: string) => l.includes("Add Auth")), "plan title listed");
+assert.ok(rows.some((l: string) => l.includes("v2")), "version shown");
+
+// type-to-search filters
+for (const c of "nothingmatches") browser.handleInput(c);
+assert.ok(!browser.render(100).some((l: string) => l.includes("Add Auth")), "filter excludes");
+for (let i = 0; i < 20; i++) browser.handleInput("\x7f"); // backspace clears
+assert.ok(browser.render(100).some((l: string) => l.includes("Add Auth")), "filter restored");
+
+// enter opens the selected plan
+browser.handleInput("\r");
+assert.ok(opened && opened.endsWith("auth.md"), "enter selects plan path");
+
+// esc closes
+const closeCtx = {
+	cwd: dir,
+	isIdle: () => true,
+	ui: { notify: () => {}, theme, custom: async (factory: (tui: unknown, theme: unknown, kb: unknown, done: (v: string | null) => void) => unknown) => { const b: any = factory({ requestRender: () => {} }, theme, {}, (v: string | null) => { closed = v === null; }); b.handleInput("\x1b"); return undefined; } },
+};
+await cmds["plans"]!.handler("", closeCtx as never);
+assert.ok(closed, "esc closes browser");
+
+console.log("browser + /plan checks passed");
+
 await rm(dir, { recursive: true, force: true });
-console.log(`reader-smoke: renders=${renders} — all checks passed`);
