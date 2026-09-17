@@ -6,6 +6,8 @@
 // carries pointers (notes/03-pi-extension-design.md).
 
 import { Type } from "typebox";
+import { access, copyFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
 	Input,
 	Key,
@@ -15,7 +17,7 @@ import {
 	type Component,
 	type Focusable,
 } from "@earendil-works/pi-tui";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	buildPlanReaderDisplayRows,
 	buildPlanReaderRows,
@@ -61,6 +63,7 @@ type ReaderResult =
 	| { kind: "submit"; newVersionRequested: true; annotations: Annotation[] }
 	| { kind: "execute"; annotations: Annotation[] }
 	| { kind: "approve"; annotations: Annotation[] }
+	| { kind: "fresh"; annotations: Annotation[] }
 	| { kind: "cancel" };
 
 interface ReaderTheme {
@@ -88,7 +91,7 @@ function makeTheme(t: { fg(color: string, s: string): string; bg(color: string, 
 // ---------- component ----------
 
 interface ReaderAction {
-	id: "feedback" | "execute" | "auto-accept" | "cancel";
+	id: "feedback" | "execute" | "auto-accept" | "fresh" | "cancel";
 	label: string;
 	chord: string;
 	hint: string;
@@ -99,6 +102,7 @@ class PlanReader implements Component, Focusable {
 	private theme: ReaderTheme;
 	private variant: Variant;
 	private dir: string;
+	private allowFresh: boolean;
 	private filePath: string;
 	private title: string;
 	private version: number;
@@ -139,9 +143,11 @@ class PlanReader implements Component, Focusable {
 		theme: { fg(color: string, s: string): string; bg(color: string, s: string): string };
 		variant: Variant;
 		dir: string;
+		allowFresh?: boolean;
 		plan: { filePath: string; title: string; version?: number; annotations: Annotation[] };
 		done: (result: ReaderResult) => void;
 	}) {
+		this.allowFresh = opts.allowFresh ?? false;
 		this.tui = opts.tui;
 		this.theme = makeTheme(opts.theme);
 		this.variant = opts.variant;
@@ -194,6 +200,7 @@ class PlanReader implements Component, Focusable {
 				? [
 						...(n > 0 ? [submit] : []),
 						{ id: "auto-accept", label: "Approve", chord: "ctrl+a", hint: n > 0 ? "executes the plan · comments go along as notes" : "executes the plan" },
+						...(this.allowFresh ? [{ id: "fresh" as const, label: "Start fresh", chord: "ctrl+f", hint: "new session with only the approved plan" }] : []),
 						{ id: "cancel", label: "Cancel", chord: "esc", hint: "" },
 					]
 				: [
@@ -266,6 +273,8 @@ class PlanReader implements Component, Focusable {
 			this.runAction("auto-accept");
 		} else if (matchesKey(data, Key.ctrl("e"))) {
 			this.runAction("execute");
+		} else if (matchesKey(data, Key.ctrl("f"))) {
+			this.runAction("fresh");
 		} else if (matchesKey(data, Key.ctrl("n")) || matchesKey(data, Key.ctrl("p"))) {
 			const next = jumpMarked({
 				marked: markedLines(this.annotations, this.changed),
@@ -316,6 +325,8 @@ class PlanReader implements Component, Focusable {
 			} else {
 				this.done({ kind: "approve", annotations: [] });
 			}
+		} else if (id === "fresh") {
+			this.done({ kind: "fresh", annotations: this.annotations });
 		} else if (id === "cancel") {
 			this.done({ kind: "cancel" });
 		}
@@ -548,14 +559,55 @@ function commentsPathFor(filePath: string): string {
 	return filePath.replace(/\.md$/, ".comments.json");
 }
 
+// ---------- planning state & tool policy ----------
+
+let planningActive = false;
+
+const PLANNING_READONLY_MESSAGE =
+	"Blocked: planning is active and only read-only operations are allowed. " +
+	"Finish the plan and call plan_review to present it (the user can also run /plan off).";
+
+// ponytail: fixed read-only allowlist for bash during planning; move to a
+// configurable setting if exploration keeps hitting gaps (e.g. awk, jq).
+const READ_ONLY_SHELL = new Set([
+	"ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "file", "stat", "pwd",
+	"which", "whoami", "env", "echo", "tree", "du", "df", "date", "sort", "uniq", "git",
+]);
+const READ_ONLY_GIT = new Set([
+	"status", "log", "diff", "show", "branch", "remote", "tag", "stash list",
+	"config --get", "rev-parse", "blame", "shortlog", "describe", "ls-files",
+]);
+// npm subcommands that don't fetch code or write outside the project's node_modules:
+// view/search/ls/outdated are reads; test/run execute package scripts (needed to
+// understand a codebase). node/npx/python3 excluded entirely: arbitrary code execution.
+const READ_ONLY_NPM = new Set(["view", "search", "ls", "outdated", "test", "run"]);
+
+/** Allowlist-based read-only check for shell commands during planning. */
+export function isReadOnlyShell(command: string): boolean {
+	const tokens = command.trim().split(/\s+/);
+	const cmd = tokens[0]?.replace(/^.*\//, "");
+	if (!cmd || !READ_ONLY_SHELL.has(cmd)) return false;
+	if (cmd !== "git" && cmd !== "npm") return true;
+	const sub = tokens.slice(1).join(" ");
+	if (cmd === "npm") {
+		const first = tokens[1] ?? "";
+		return READ_ONLY_NPM.has(first) && first !== "";
+	}
+	for (const ok of READ_ONLY_GIT) {
+		if (sub === ok || sub.startsWith(`${ok} `) || sub.startsWith(`${ok} -`)) return true;
+	}
+	return false;
+}
+
 // ---------- entry points ----------
 
 async function openReaderOn(
-	ctx: ExtensionContext,
+	ctx: ExtensionCommandContext,
 	pi: ExtensionAPI,
 	variant: Variant,
 	dir: string,
 	plan: PlanEntry,
+	allowFresh: boolean,
 ): Promise<void> {
 	const result = await ctx.ui.custom<ReaderResult>(
 		(tui, theme, _keybindings, done) =>
@@ -564,6 +616,7 @@ async function openReaderOn(
 				theme,
 				variant,
 				dir,
+				allowFresh,
 				plan: { filePath: plan.filePath, title: plan.title, version: plan.version, annotations: plan.annotations },
 				done,
 			}),
@@ -577,12 +630,23 @@ async function openReaderOn(
 		pi.sendUserMessage(revisionPrompt(plan.filePath, newVersion, result.annotations.length));
 	} else if (result.kind === "execute") {
 		await recordPlanOutcome({ filePath: plan.filePath, dir, status: "approved" });
+		planningActive = false;
 		pi.sendUserMessage(executePrompt(plan.filePath));
+	} else if (result.kind === "fresh") {
+		await recordPlanOutcome({ filePath: plan.filePath, dir, status: "approved" });
+		planningActive = false;
+		// fresh implementation: a new session carrying only the plan contract,
+		// so planning's exploration never pollutes implementation context
+		await ctx.newSession({
+			withSession: async (fresh) => {
+				await fresh.sendUserMessage(executePrompt(plan.filePath));
+			},
+		});
 	}
 	// approve has no meaning in browse variant; cancel: plan file stays saved
 }
 
-async function openReader(ctx: ExtensionContext, pi: ExtensionAPI, variant: Variant, target?: string): Promise<void> {
+async function openReader(ctx: ExtensionCommandContext, pi: ExtensionAPI, variant: Variant, target?: string): Promise<void> {
 	const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
 	const plans = await listPlans({ dir });
 	if (plans.length === 0) {
@@ -593,7 +657,7 @@ async function openReader(ctx: ExtensionContext, pi: ExtensionAPI, variant: Vari
 	const plan = t
 		? (plans.find((p) => p.fileName.toLowerCase() === t || p.fileName.replace(/\.md$/, "").toLowerCase() === t || p.title.toLowerCase() === t) ?? plans[0]!)
 		: plans[0]!;
-	await openReaderOn(ctx, pi, variant, dir, plan);
+	await openReaderOn(ctx, pi, variant, dir, plan, true);
 }
 
 function revisionPrompt(filePath: string, newVersion: number, count: number): string {
@@ -727,7 +791,7 @@ class PlansBrowser implements Component {
 	invalidate(): void {}
 }
 
-async function openPlansBrowser(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+async function openPlansBrowser(ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
 	const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
 	const plans = await listPlans({ dir });
 	if (plans.length === 0) {
@@ -740,7 +804,29 @@ async function openPlansBrowser(ctx: ExtensionContext, pi: ExtensionAPI): Promis
 	if (!filePath) return;
 	const plans2 = await listPlans({ dir }); // re-list: reader may have changed metadata
 	const plan = plans2.find((p) => p.filePath === filePath) ?? plans[0]!;
-	await openReaderOn(ctx, pi, "browse", dir, plan);
+	await openReaderOn(ctx, pi, "browse", dir, plan, true);
+}
+
+async function exportPlan(ctx: ExtensionContext, dest?: string): Promise<void> {
+	const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
+	const plans = await listPlans({ dir });
+	if (plans.length === 0) {
+		ctx.ui.notify("No plans to export.", "info");
+		return;
+	}
+	const target = dest
+		? (dest.startsWith("/") ? dest : join(ctx.cwd, dest))
+		: join(ctx.cwd, "PLAN.md");
+	try {
+		await access(target);
+		ctx.ui.notify(`Export cancelled: ${target} already exists (export never overwrites).`, "warning");
+		return;
+	} catch {
+		// target free
+	}
+	const plan = plans[0]!;
+	await copyFile(plan.filePath, target);
+	ctx.ui.notify(`Exported "${plan.title}" (v${plan.version ?? 1}) to ${target}`, "info");
 }
 
 function planRequestPrompt(cwd: string, task: string): string {
@@ -756,18 +842,42 @@ function planRequestPrompt(cwd: string, task: string): string {
 
 export default function planReviewExtension(pi: ExtensionAPI): void {
 	registerCommandsAndTools(pi);
+
+	// planning tool policy: read-only while planning is active
+	pi.on("tool_call", async (event) => {
+		if (!planningActive) return;
+		if (event.toolName === "edit" || event.toolName === "write") {
+			return { block: true, reason: PLANNING_READONLY_MESSAGE };
+		}
+		if (event.toolName === "bash" && typeof event.input.command === "string" && !isReadOnlyShell(event.input.command)) {
+			return { block: true, reason: PLANNING_READONLY_MESSAGE };
+		}
+	});
 }
 
 function registerCommandsAndTools(pi: ExtensionAPI): void {
 	pi.registerCommand("plan", {
-		description: "Plan a task: research, write .pi/plans/<name>.md, present for review",
+		description: "Plan a task: research, write .pi/plans/<name>.md, present for review (start/off/export routes)",
 		handler: async (args, ctx) => {
-			const task = args?.trim();
-			if (!task) {
-				ctx.ui.notify("Usage: /plan <task> — research, write a plan, present it for review", "info");
+			const raw = args?.trim() ?? "";
+			// cmdc-style routes: exact subcommand words; anything else is a planning task
+			if (raw === "start" || raw === "") {
+				if (raw === "start") planningActive = true;
+				ctx.ui.notify(raw === "start" ? "Planning active — edits are blocked until the plan is approved." : "Usage: /plan <task> · /plan start · /plan off · /plan export [path]", "info");
 				return;
 			}
-			const prompt = planRequestPrompt(ctx.cwd, task);
+			if (raw === "off" || raw === "exit") {
+				planningActive = false;
+				ctx.ui.notify("Planning off — edits allowed again.", "info");
+				return;
+			}
+			if (raw === "export" || raw.startsWith("export ")) {
+				const dest = raw.slice(6).trim();
+				await exportPlan(ctx, dest || undefined);
+				return;
+			}
+			planningActive = true;
+			const prompt = planRequestPrompt(ctx.cwd, raw);
 			if (ctx.isIdle()) pi.sendUserMessage(prompt);
 			else pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 		},
@@ -777,6 +887,35 @@ function registerCommandsAndTools(pi: ExtensionAPI): void {
 		description: "Open the plan review reader (freshest plan in .pi/plans/, or by name/title)",
 		handler: async (args, ctx) => {
 			await openReader(ctx, pi, "browse", args?.trim() || undefined);
+		},
+	});
+
+	pi.registerTool({
+		name: "plan_mode_question",
+		label: "Plan question",
+		description:
+			"Ask the user a structured question about a material preference, ambiguity, or tradeoff while planning. " +
+			"Use this instead of guessing when the answer would materially change the plan. Not for minor assumptions.",
+		parameters: Type.Object({
+			question: Type.String({ description: "The question to ask, ending with ?" }),
+			options: Type.Optional(Type.Array(Type.String(), { description: "2-4 answer choices. Omit for free-form input." })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!planningActive) {
+				return { content: [{ type: "text", text: "error: Planning is not active. This tool asks the user plan-shaping questions — it is only available while planning (user runs /plan)." }], details: {} };
+			}
+			let answer: string | undefined;
+			if (params.options && params.options.length > 0) {
+				const choices = [...params.options];
+				if ((params.options.length ?? 0) >= 2) choices.push("Other…");
+				const picked = await ctx.ui.select(params.question, choices);
+				if (picked === undefined) return { content: [{ type: "text", text: "User dismissed the question. Proceed with your best judgment and note the assumption in the plan." }], details: {} };
+				answer = picked === "Other…" ? await ctx.ui.input(params.question) : picked;
+			} else {
+				answer = await ctx.ui.input(params.question);
+			}
+			if (!answer?.trim()) return { content: [{ type: "text", text: "No answer given. Proceed with your best judgment and note the assumption in the plan." }], details: {} };
+			return { content: [{ type: "text", text: `User answered: ${answer.trim()}` }], details: {} };
 		},
 	});
 
@@ -842,13 +981,21 @@ function registerCommandsAndTools(pi: ExtensionAPI): void {
 			}
 			if (result.kind === "execute") {
 				await recordPlanOutcome({ filePath: params.filePath, dir, status: "approved" });
+				planningActive = false;
 				return {
 					content: [{ type: "text", text: `${executePrompt(params.filePath)}` }],
 					details: {},
 				};
 			}
+			if (result.kind === "fresh") {
+				return {
+					content: [{ type: "text", text: "Fresh-session implementation is only available when the panel is opened via /plan-review (session replacement is command-only). Choose Approve instead, or ask the user to run /plan-review." }],
+					details: {},
+				};
+			}
 			// approve
 			await recordPlanOutcome({ filePath: params.filePath, dir, status: "approved" });
+			planningActive = false;
 			const notes = result.annotations.length > 0 ? await writeApprovalNotes(params.filePath, result.annotations) : "";
 			return {
 				content: [{ type: "text", text: `Plan approved — begin implementation now. ${params.filePath} is the source of truth; read it first and implement step by step.${notes}` }],
