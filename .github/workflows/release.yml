@@ -9,11 +9,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write # npm trusted publishing (OIDC) — no token secret needed
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # node 24 ships npm 11.5+ (required for trusted publishing)
+          node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
       - name: Version from release tag
@@ -21,5 +23,3 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
