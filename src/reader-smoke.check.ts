@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writePlanContent, listPlans, readComments, snapshotPlanVersion } from "./plan-store.ts";
+import { isReadOnlyShell } from "../index.ts";
 
 // minimal stub so index.ts's pi-tui imports resolve without a running TUI
 const dir = await mkdtemp(join(tmpdir(), "pi-plan-reader-"));
@@ -47,6 +48,7 @@ const stubPi = {
 	registerTool: (def: { name: string }) => { registered[`tool:${def.name}`] = def; },
 	registerFlag: () => {},
 	sendUserMessage: (msg: string) => { sent.push(msg); },
+	on: () => {},
 };
 const sent: string[] = [];
 planReviewExtension(stubPi as never);
@@ -147,6 +149,7 @@ mod.default({
 	registerTool: () => {},
 	registerFlag: () => {},
 	sendUserMessage: (m: string, o?: { deliverAs?: string }) => sent2.push(o ? `${m}|${o.deliverAs}` : m),
+	on: () => {},
 } as never);
 assert.ok(cmds["plan"] && cmds["plans"] && cmds["plan-review"], "commands registered: plan, plans, plan-review");
 
@@ -219,3 +222,74 @@ assert.ok(closed, "esc closes browser");
 console.log("browser + /plan checks passed");
 
 await rm(dir, { recursive: true, force: true });
+
+// ---------- planning tool policy & routes ----------
+// captured handlers from the FIRST registration include tool_call; re-register to grab it
+let toolCallResult: { block: boolean; reason: string } | null = null;
+type ToolCallResult = { block: boolean; reason: string } | void;
+const hooks: { toolCall: ((event: { toolName: string; input: Record<string, unknown> }) => Promise<ToolCallResult>) | null } = { toolCall: null };
+const questionTool: { name: string; execute: (id: string, params: { question: string; options?: string[] }, signal: undefined, onUpdate: undefined, ctx: unknown) => Promise<{ content: { type: string; text: string }[] }> } = { name: "", execute: async () => ({ content: [] }) };
+{
+	const stubPi5 = {
+		registerCommand: () => {},
+		registerTool: (d: any) => { if (d.name === "plan_mode_question") Object.assign(questionTool, d); },
+		registerFlag: () => {},
+		sendUserMessage: () => {},
+		on: (event: string, handler: (e: { toolName: string; input: Record<string, unknown> }) => Promise<ToolCallResult>) => { if (event === "tool_call") hooks.toolCall = handler; },
+	};
+	mod.default(stubPi5 as never);
+}
+assert.ok(hooks.toolCall, "tool_call handler registered");
+
+// policy inactive -> nothing blocked (turn planning off from the earlier /plan <task> test)
+const startCtx = { cwd: dir, isIdle: () => true, ui: { notify: () => {}, theme, custom: async () => undefined } };
+await cmds["plan"]!.handler("off", startCtx as never);
+assert.equal(await hooks.toolCall!({ toolName: "edit", input: {} }), undefined, "no block when planning inactive");
+
+// activate via /plan start
+await cmds["plan"]!.handler("start", startCtx as never);
+toolCallResult = (await hooks.toolCall!({ toolName: "edit", input: {} })) ?? null;
+assert.ok(toolCallResult?.block, "edit blocked while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "rm -rf /tmp/x" } })) ?? null;
+assert.ok(toolCallResult?.block, "mutating bash blocked while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "git status" } })) ?? null;
+assert.equal(toolCallResult, null, "read-only git allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "git push" } })) ?? null;
+assert.ok(toolCallResult?.block, "git push blocked while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "rg pattern src/" } })) ?? null;
+assert.equal(toolCallResult, null, "rg allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "read", input: {} })) ?? null;
+assert.equal(toolCallResult, null, "read never blocked");
+
+// isReadOnlyShell unit checks (imported from the extension module)
+assert.ok(isReadOnlyShell("ls -la"));
+assert.ok(isReadOnlyShell("git log --oneline -5"));
+assert.ok(!isReadOnlyShell("npm install left-pad"));
+assert.ok(!isReadOnlyShell("sed -i s/a/b/ file"));
+
+// /plan off deactivates
+await cmds["plan"]!.handler("off", startCtx as never);
+toolCallResult = (await hooks.toolCall!({ toolName: "edit", input: {} })) ?? null;
+assert.equal(toolCallResult, null, "edit allowed after /plan off");
+
+// plan_mode_question: inactive -> soft error; active -> select flow
+const qInactive = await questionTool.execute("id", { question: "Which DB?" }, undefined, undefined, {});
+assert.ok(qInactive.content[0]!.text.startsWith("error:"), "question tool gated on planning");
+const picked: string[] = [];
+const qCtx = {
+	cwd: dir,
+	ui: {
+		select: async (q: string, options: string[]) => { picked.push(q); return options[0]; },
+		input: async (q: string) => { picked.push(q); return "SQLite, obviously"; },
+	},
+};
+await cmds["plan"]!.handler("start", startCtx as never);
+const qAnswered = await questionTool.execute("id", { question: "Which database?", options: ["Postgres", "SQLite"] }, undefined, undefined, qCtx as never);
+assert.ok(qAnswered.content[0]!.text.includes("User answered: Postgres"), "select flow returns the choice");
+const qOther = await questionTool.execute("id", { question: "Which database?", options: ["Postgres", "SQLite"] }, undefined, undefined, {
+	...qCtx, ui: { select: async () => "Other…", input: async () => "DuckDB" },
+} as never);
+assert.ok(qOther.content[0]!.text.includes("DuckDB"), "Other… falls through to free-form input");
+await cmds["plan"]!.handler("off", startCtx as never);
+
+console.log("policy + routes + question checks passed");
