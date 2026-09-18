@@ -8,7 +8,7 @@
 import { Type } from "typebox";
 import { constants, realpathSync, statSync } from "node:fs";
 import { copyFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
 	Input,
 	Key,
@@ -571,6 +571,30 @@ const PLANNING_READONLY_MESSAGE =
 // Default-deny for tools, with the read side explicitly listed. readSeek_* entries are
 // this deployment's ReadSeek suite — only its read-oriented tools; readSeek_edit/write/
 // rename stay blocked. subagent_consult spawns read-only scouts by contract.
+const PLANNING_BLOCKED_WRITE_MESSAGE =
+	"Blocked: while planning you can only write the plan file itself (.pi/plans/<name>.md). " +
+	"Finish the plan and call plan_review to present it (the user can also run /plan off).";
+
+/** True when a write/edit targets a .md file inside <cwd>/.pi/plans/ — the one write
+ *  allowed during planning, since writing the plan is the point of planning. */
+function isPlanFileWrite(cwd: string, input: unknown): boolean {
+	const path = (input as { path?: unknown; file_path?: unknown }).path ?? (input as { file_path?: unknown }).file_path;
+	if (typeof path !== "string") return false;
+	if (!path.toLowerCase().endsWith(".md")) return false;
+	const plansDir = join(cwd, ".pi", "plans");
+	try {
+		// plans dir exists: symlink-aware containment
+		const realDir = realpathSync(plansDir);
+		const realFile = realpathSync(resolve(cwd, path));
+		return realFile.startsWith(realDir + "/");
+	} catch (err) {
+		// plans dir may not exist yet (first plan write): lexical containment
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+		const rel = relative(resolve(cwd, plansDir), resolve(cwd, path));
+		return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+	}
+}
+
 const PLANNING_ALLOWED_TOOLS = new Set([
 	"read", "grep", "find", "ls", "plan_review", "plan_mode_question", "subagent_consult",
 	"readSeek_grep", "readSeek_search", "readSeek_view", "readSeek_digest", "readSeek_def", "readSeek_refs",
@@ -835,8 +859,8 @@ function planRequestPrompt(cwd: string, task: string): string {
 		`Plan request: ${task}\n\n` +
 		`Research what's needed — do not implement anything yet. While planning, only read-only operations work: ` +
 		`prefer the read/grep/find/ls tools; bash is limited to read-only commands (no redirection, chaining, or code execution). ` +
-		`Then write an implementation plan ` +
-		`as markdown to ${dir}/<descriptive-name>.md (choose a kebab-case name yourself; the file must be a .md inside that directory). ` +
+		`Then write the implementation plan ` +
+		`as markdown to ${dir}/<descriptive-name>.md (choose a kebab-case name yourself; that directory is the one path you may write while planning). ` +
 		`The plan should be opinionated and actionable: recommended approach only, critical file paths, and a verification section. ` +
 		`When the plan file is written, call the plan_review tool with its absolute path to present it for approval.`
 	);
@@ -846,8 +870,14 @@ export default function planReviewExtension(pi: ExtensionAPI): void {
 	registerCommandsAndTools(pi);
 
 	// planning tool policy: default-deny while planning is active
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!planningActive) return;
+		if ((event.toolName === "write" || event.toolName === "edit") && isPlanFileWrite(ctx.cwd, event.input)) {
+			return; // writing the plan is the point of planning
+		}
+		if (event.toolName === "write" || event.toolName === "edit") {
+			return { block: true, reason: PLANNING_BLOCKED_WRITE_MESSAGE };
+		}
 		if (event.toolName === "bash") {
 			const blockedSegment = findBlockedCommandSegment(readCommand(event.input));
 			if (blockedSegment !== undefined) {

@@ -234,7 +234,7 @@ const questionTool: { name: string; execute: (id: string, params: { question: st
 		registerTool: (d: any) => { if (d.name === "plan_mode_question") Object.assign(questionTool, d); },
 		registerFlag: () => {},
 		sendUserMessage: () => {},
-		on: (event: string, handler: (e: { toolName: string; input: Record<string, unknown> }) => Promise<ToolCallResult>) => { if (event === "tool_call") hooks.toolCall = handler; },
+		on: (event: string, handler: (e: { toolName: string; input: Record<string, unknown> }, ctx: { cwd: string }) => Promise<ToolCallResult>) => { if (event === "tool_call") hooks.toolCall = (e) => handler(e, { cwd: dir }); },
 	};
 	mod.default(stubPi5 as never);
 }
