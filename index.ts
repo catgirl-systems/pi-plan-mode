@@ -6,7 +6,8 @@
 // carries pointers (notes/03-pi-extension-design.md).
 
 import { Type } from "typebox";
-import { access, copyFile } from "node:fs/promises";
+import { constants, realpathSync, statSync } from "node:fs";
+import { copyFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	Input,
@@ -21,6 +22,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import {
 	buildPlanReaderDisplayRows,
 	buildPlanReaderRows,
+	sanitizePlanText,
 	classifyPlanLines,
 	clampScrollOffset,
 	diffPlanChangedLines,
@@ -46,6 +48,7 @@ import {
 	setPlanAnnotations,
 	writeComments,
 	clearComments,
+	commentsPathFor,
 	type PlanEntry,
 } from "./src/plan-store.ts";
 
@@ -153,9 +156,9 @@ class PlanReader implements Component, Focusable {
 		this.variant = opts.variant;
 		this.dir = opts.dir;
 		this.filePath = opts.plan.filePath;
-		this.title = opts.plan.title;
+		this.title = sanitizePlanText(opts.plan.title);
 		this.version = opts.plan.version ?? 1;
-		this.annotations = opts.plan.annotations;
+		this.annotations = opts.plan.annotations.map((a) => ({ ...a, text: sanitizePlanText(a.text) }));
 		this.done = opts.done;
 		this.rebuildActions();
 		void this.load();
@@ -163,7 +166,7 @@ class PlanReader implements Component, Focusable {
 
 	private async load(): Promise<void> {
 		const content = (await readPlanContent(this.filePath)) ?? "";
-		this.lines = content.replace(/\r\n/g, "\n").split("\n");
+		this.lines = content.replace(/\r\n/g, "\n").split("\n").map(sanitizePlanText);
 		this.roles = classifyPlanLines(this.lines);
 		if (this.version > 1) {
 			const prev = await readPlanVersionSnapshot({
@@ -555,51 +558,40 @@ function isLastSegmentOf(all: DisplayRow[], dr: DisplayRow): boolean {
 	return segments.at(-1) === dr;
 }
 
-function commentsPathFor(filePath: string): string {
-	return filePath.replace(/\.md$/, ".comments.json");
-}
-
 // ---------- planning state & tool policy ----------
 
 let planningActive = false;
 
 const PLANNING_READONLY_MESSAGE =
-	"Blocked: planning is active and only read-only operations are allowed. " +
-	"Finish the plan and call plan_review to present it (the user can also run /plan off).";
+	"Blocked: planning is active — only read tools are available. Finish the plan and " +
+	"call plan_review to present it (the user can also run /plan off).";
 
-// ponytail: fixed read-only allowlist for bash during planning; move to a
-// configurable setting if exploration keeps hitting gaps (e.g. awk, jq).
-const READ_ONLY_SHELL = new Set([
-	"ls", "cat", "head", "tail", "grep", "rg", "find", "wc", "file", "stat", "pwd",
-	"which", "whoami", "env", "echo", "tree", "du", "df", "date", "sort", "uniq", "git",
-]);
-const READ_ONLY_GIT = new Set([
-	"status", "log", "diff", "show", "branch", "remote", "tag", "stash list",
-	"config --get", "rev-parse", "blame", "shortlog", "describe", "ls-files",
-]);
-// npm subcommands that don't fetch code or write outside the project's node_modules:
-// view/search/ls/outdated are reads; test/run execute package scripts (needed to
-// understand a codebase). node/npx/python3 excluded entirely: arbitrary code execution.
-const READ_ONLY_NPM = new Set(["view", "search", "ls", "outdated", "test", "run"]);
-
-/** Allowlist-based read-only check for shell commands during planning. */
-export function isReadOnlyShell(command: string): boolean {
-	const tokens = command.trim().split(/\s+/);
-	const cmd = tokens[0]?.replace(/^.*\//, "");
-	if (!cmd || !READ_ONLY_SHELL.has(cmd)) return false;
-	if (cmd !== "git" && cmd !== "npm") return true;
-	const sub = tokens.slice(1).join(" ");
-	if (cmd === "npm") {
-		const first = tokens[1] ?? "";
-		return READ_ONLY_NPM.has(first) && first !== "";
-	}
-	for (const ok of READ_ONLY_GIT) {
-		if (sub === ok || sub.startsWith(`${ok} `) || sub.startsWith(`${ok} -`)) return true;
-	}
-	return false;
-}
+// Default-deny: token-based shell filtering is unauditable (redirection, ;, find -exec,
+// env, npm run …), so bash is blocked outright during planning. Exploration is covered
+// by Pi's read-only built-ins; plan_review/plan_mode_question are part of the workflow.
+const PLANNING_ALLOWED_TOOLS = new Set(["read", "grep", "find", "ls", "plan_review", "plan_mode_question"]);
 
 // ---------- entry points ----------
+
+const MAX_PLAN_BYTES = 262144;
+
+/**
+ * Containment for LLM-supplied plan_review filePaths: must resolve (symlinks followed
+ * and checked) to a regular .md file inside the real plans dir, within the size cap.
+ */
+function containedPlanPath(plansDir: string, filePath: string): string | null {
+	try {
+		const realDir = realpathSync(plansDir);
+		const realFile = realpathSync(filePath);
+		if (!realFile.startsWith(realDir + "/")) return null;
+		if (!realFile.endsWith(".md")) return null;
+		const st = statSync(realFile);
+		if (!st.isFile() || st.size > MAX_PLAN_BYTES) return null;
+		return realFile;
+	} catch {
+		return null;
+	}
+}
 
 async function openReaderOn(
 	ctx: ExtensionCommandContext,
@@ -817,15 +809,18 @@ async function exportPlan(ctx: ExtensionContext, dest?: string): Promise<void> {
 	const target = dest
 		? (dest.startsWith("/") ? dest : join(ctx.cwd, dest))
 		: join(ctx.cwd, "PLAN.md");
-	try {
-		await access(target);
-		ctx.ui.notify(`Export cancelled: ${target} already exists (export never overwrites).`, "warning");
-		return;
-	} catch {
-		// target free
-	}
 	const plan = plans[0]!;
-	await copyFile(plan.filePath, target);
+	try {
+		// COPYFILE_EXCL keeps "never overwrites" true without a racy pre-check
+		await copyFile(plan.filePath, target, constants.COPYFILE_EXCL);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "EEXIST") {
+			ctx.ui.notify(`Export cancelled: ${target} already exists (export never overwrites).`, "warning");
+			return;
+		}
+		throw err;
+	}
 	ctx.ui.notify(`Exported "${plan.title}" (v${plan.version ?? 1}) to ${target}`, "info");
 }
 
@@ -843,13 +838,10 @@ function planRequestPrompt(cwd: string, task: string): string {
 export default function planReviewExtension(pi: ExtensionAPI): void {
 	registerCommandsAndTools(pi);
 
-	// planning tool policy: read-only while planning is active
+	// planning tool policy: default-deny while planning is active
 	pi.on("tool_call", async (event) => {
 		if (!planningActive) return;
-		if (event.toolName === "edit" || event.toolName === "write") {
-			return { block: true, reason: PLANNING_READONLY_MESSAGE };
-		}
-		if (event.toolName === "bash" && typeof event.input.command === "string" && !isReadOnlyShell(event.input.command)) {
+		if (!PLANNING_ALLOWED_TOOLS.has(event.toolName)) {
 			return { block: true, reason: PLANNING_READONLY_MESSAGE };
 		}
 	});
@@ -904,15 +896,15 @@ function registerCommandsAndTools(pi: ExtensionAPI): void {
 			if (!planningActive) {
 				return { content: [{ type: "text", text: "error: Planning is not active. This tool asks the user plan-shaping questions — it is only available while planning (user runs /plan)." }], details: {} };
 			}
+			const question = sanitizePlanText(params.question);
 			let answer: string | undefined;
 			if (params.options && params.options.length > 0) {
-				const choices = [...params.options];
-				if ((params.options.length ?? 0) >= 2) choices.push("Other…");
-				const picked = await ctx.ui.select(params.question, choices);
+				const choices = [...(params.options as string[]).map(sanitizePlanText), "Other…"];
+				const picked = await ctx.ui.select(question, choices);
 				if (picked === undefined) return { content: [{ type: "text", text: "User dismissed the question. Proceed with your best judgment and note the assumption in the plan." }], details: {} };
-				answer = picked === "Other…" ? await ctx.ui.input(params.question) : picked;
+				answer = picked === "Other…" ? await ctx.ui.input(question) : picked;
 			} else {
-				answer = await ctx.ui.input(params.question);
+				answer = await ctx.ui.input(question);
 			}
 			if (!answer?.trim()) return { content: [{ type: "text", text: "No answer given. Proceed with your best judgment and note the assumption in the plan." }], details: {} };
 			return { content: [{ type: "text", text: `User answered: ${answer.trim()}` }], details: {} };
@@ -938,10 +930,17 @@ function registerCommandsAndTools(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const dir = defaultPlansDir({ cwd: ctx.cwd, home: process.env.HOME ?? "" });
-			const content = await readPlanContent(params.filePath);
+			const contained = containedPlanPath(dir, params.filePath);
+			if (!contained) {
+				return {
+					content: [{ type: "text", text: `error: plan_review only presents markdown plans inside ${dir} (regular files, max 256 KB, symlinks must stay inside the directory). Write the plan there first, then call plan_review with its absolute path.` }],
+					details: {},
+				};
+			}
+			const content = await readPlanContent(contained);
 			if (!content?.trim()) {
 				return {
-					content: [{ type: "text", text: `error: Plan file not found or empty: ${params.filePath}. Write the plan there first (markdown, absolute path).` }],
+					content: [{ type: "text", text: `error: Plan file not found or empty: ${contained}. Write the plan there first (markdown, absolute path).` }],
 					details: {},
 				};
 			}
@@ -955,8 +954,8 @@ function registerCommandsAndTools(pi: ExtensionAPI): void {
 						variant: "approval",
 						dir,
 						plan: {
-							filePath: params.filePath,
-							title: meta?.title ?? params.filePath.split("/").pop() ?? "Plan",
+							filePath: contained,
+							title: meta?.title ?? contained.split("/").pop() ?? "Plan",
 							version: meta?.version,
 							annotations: meta?.annotations ?? [],
 						},

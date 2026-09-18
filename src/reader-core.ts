@@ -265,6 +265,17 @@ export function diffPlanChangedLines(input: { previous: string; current: string[
   return changed;
 }
 
+// ---------- sanitization ----------
+
+/** Strip ANSI/OSC escape sequences and C0/C1 control chars (keeps \t).
+ *  Hostile plan content must not reach the terminal raw. */
+export function sanitizePlanText(text: string): string {
+	return text
+		// complete sequences first so their printable payload doesn't linger
+		.replace(/\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-Z\\-_])/g, "")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+}
+
 // ---------- annotations ----------
 
 /** Replace the annotation on `line`; empty text removes it. Result sorted by line. */

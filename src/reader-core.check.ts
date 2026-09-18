@@ -1,6 +1,7 @@
 // Runnable check: node --experimental-strip-types src/reader-core.check.ts
 import assert from "node:assert";
 import {
+  sanitizePlanText,
   splitPlanLines,
   classifyPlanLines,
   wrapPlanText,
@@ -154,6 +155,13 @@ ok("jump next/previous with wraparound", () => {
   assert.equal(jumpMarked({ marked, from: 15, direction: "next", lineCount: 20 }), 3); // wrap
   assert.equal(jumpMarked({ marked, from: 2, direction: "previous", lineCount: 20 }), 12); // wrap
   assert.equal(jumpMarked({ marked: [], from: 5, direction: "next", lineCount: 20 }), undefined);
+});
+
+ok("sanitize strips ANSI/OSC and control chars, keeps tabs", () => {
+	assert.equal(sanitizePlanText("\x1b[31mred\x1b[0m"), "red");
+	assert.equal(sanitizePlanText("\x1b]0;evil\x07title"), "title");
+	assert.equal(sanitizePlanText("a\rb\x00c\x7fd"), "abcd");
+	assert.equal(sanitizePlanText("keep\ttabs"), "keep\ttabs");
 });
 
 ok("split normalizes CRLF", () => {

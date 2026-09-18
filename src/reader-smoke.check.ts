@@ -5,7 +5,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writePlanContent, listPlans, readComments, snapshotPlanVersion } from "./plan-store.ts";
-import { isReadOnlyShell } from "../index.ts";
 
 // minimal stub so index.ts's pi-tui imports resolve without a running TUI
 const dir = await mkdtemp(join(tmpdir(), "pi-plan-reader-"));
@@ -246,26 +245,24 @@ const startCtx = { cwd: dir, isIdle: () => true, ui: { notify: () => {}, theme, 
 await cmds["plan"]!.handler("off", startCtx as never);
 assert.equal(await hooks.toolCall!({ toolName: "edit", input: {} }), undefined, "no block when planning inactive");
 
-// activate via /plan start
+// activate via /plan start: default-deny, only read built-ins + plan tools allowed
 await cmds["plan"]!.handler("start", startCtx as never);
 toolCallResult = (await hooks.toolCall!({ toolName: "edit", input: {} })) ?? null;
 assert.ok(toolCallResult?.block, "edit blocked while planning");
-toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "rm -rf /tmp/x" } })) ?? null;
-assert.ok(toolCallResult?.block, "mutating bash blocked while planning");
-toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "git status" } })) ?? null;
-assert.equal(toolCallResult, null, "read-only git allowed while planning");
-toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "git push" } })) ?? null;
-assert.ok(toolCallResult?.block, "git push blocked while planning");
-toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "rg pattern src/" } })) ?? null;
-assert.equal(toolCallResult, null, "rg allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "ls" } })) ?? null;
+assert.ok(toolCallResult?.block, "bash blocked outright while planning (no parser games)");
+toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "echo x > /tmp/pwned" } })) ?? null;
+assert.ok(toolCallResult?.block, "redirection form moot: bash fully blocked");
+toolCallResult = (await hooks.toolCall!({ toolName: "write", input: {} })) ?? null;
+assert.ok(toolCallResult?.block, "write blocked while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "mcp__db_query", input: {} })) ?? null;
+assert.ok(toolCallResult?.block, "unknown/MCP tools default-deny while planning");
 toolCallResult = (await hooks.toolCall!({ toolName: "read", input: {} })) ?? null;
-assert.equal(toolCallResult, null, "read never blocked");
-
-// isReadOnlyShell unit checks (imported from the extension module)
-assert.ok(isReadOnlyShell("ls -la"));
-assert.ok(isReadOnlyShell("git log --oneline -5"));
-assert.ok(!isReadOnlyShell("npm install left-pad"));
-assert.ok(!isReadOnlyShell("sed -i s/a/b/ file"));
+assert.equal(toolCallResult, null, "read allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "grep", input: {} })) ?? null;
+assert.equal(toolCallResult, null, "grep allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "plan_review", input: {} })) ?? null;
+assert.equal(toolCallResult, null, "plan_review allowed while planning");
 
 // /plan off deactivates
 await cmds["plan"]!.handler("off", startCtx as never);
@@ -273,7 +270,7 @@ toolCallResult = (await hooks.toolCall!({ toolName: "edit", input: {} })) ?? nul
 assert.equal(toolCallResult, null, "edit allowed after /plan off");
 
 // plan_mode_question: inactive -> soft error; active -> select flow
-const qInactive = await questionTool.execute("id", { question: "Which DB?" }, undefined, undefined, {});
+const qInactive = await questionTool.execute("id", { question: "Which DB?" }, undefined, undefined, { cwd: dir });
 assert.ok(qInactive.content[0]!.text.startsWith("error:"), "question tool gated on planning");
 const picked: string[] = [];
 const qCtx = {
@@ -291,5 +288,23 @@ const qOther = await questionTool.execute("id", { question: "Which database?", o
 } as never);
 assert.ok(qOther.content[0]!.text.includes("DuckDB"), "Other… falls through to free-form input");
 await cmds["plan"]!.handler("off", startCtx as never);
+
+// plan_review containment: paths outside .pi/plans are rejected before any UI
+{
+	const toolDefs: Record<string, { execute: (id: string, params: { filePath: string }, s: undefined, u: undefined, ctx: unknown) => Promise<{ content: { text: string }[] }> }> = {};
+	mod.default({
+		registerCommand: () => {},
+		registerTool: (d: { name: string; execute: never }) => { toolDefs[d.name] = d as never; },
+		registerFlag: () => {},
+		sendUserMessage: () => {},
+		on: () => {},
+	} as never);
+	const outside = await toolDefs["plan_review"]!.execute("id", { filePath: "/etc/passwd" }, undefined, undefined, { cwd: dir });
+	assert.ok(outside.content[0]!.text.startsWith("error:"), "plan_review rejects paths outside plans dir");
+	const sneaky = await toolDefs["plan_review"]!.execute("id", { filePath: join(dir, ".pi", "plans", "..", "..", "..", "etc", "passwd") }, undefined, undefined, { cwd: dir });
+	assert.ok(sneaky.content[0]!.text.startsWith("error:"), "plan_review rejects traversal outside plans dir");
+	const notMd = await toolDefs["plan_review"]!.execute("id", { filePath: join(dir, ".pi", "plans") }, undefined, undefined, { cwd: dir });
+	assert.ok(notMd.content[0]!.text.startsWith("error:"), "plan_review rejects non-.md targets");
+}
 
 console.log("policy + routes + question checks passed");
