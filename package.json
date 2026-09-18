@@ -1,6 +1,6 @@
 {
   "name": "@catgirl-systems/pi-plan-mode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Plan review reader for pi — line-addressed plan review with inline comments, version diffing, and an agent revise/re-review loop.",
   "license": "MIT",
   "repository": {
