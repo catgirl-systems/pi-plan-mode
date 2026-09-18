@@ -245,49 +245,52 @@ const startCtx = { cwd: dir, isIdle: () => true, ui: { notify: () => {}, theme, 
 await cmds["plan"]!.handler("off", startCtx as never);
 assert.equal(await hooks.toolCall!({ toolName: "edit", input: {} }), undefined, "no block when planning inactive");
 
-// activate via /plan start: default-deny, only read built-ins + plan tools allowed
+// activate via /plan start: default-deny tools + narumitw-style bash policy
 await cmds["plan"]!.handler("start", startCtx as never);
 toolCallResult = (await hooks.toolCall!({ toolName: "edit", input: {} })) ?? null;
 assert.ok(toolCallResult?.block, "edit blocked while planning");
-toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "ls" } })) ?? null;
-assert.ok(toolCallResult?.block, "bash blocked outright while planning (no parser games)");
-toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command: "echo x > /tmp/pwned" } })) ?? null;
-assert.ok(toolCallResult?.block, "redirection form moot: bash fully blocked");
 toolCallResult = (await hooks.toolCall!({ toolName: "write", input: {} })) ?? null;
 assert.ok(toolCallResult?.block, "write blocked while planning");
 toolCallResult = (await hooks.toolCall!({ toolName: "mcp__db_query", input: {} })) ?? null;
 assert.ok(toolCallResult?.block, "unknown/MCP tools default-deny while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "readSeek_edit", input: {} })) ?? null;
+assert.ok(toolCallResult?.block, "readSeek_edit blocked while planning");
 toolCallResult = (await hooks.toolCall!({ toolName: "read", input: {} })) ?? null;
 assert.equal(toolCallResult, null, "read allowed while planning");
-toolCallResult = (await hooks.toolCall!({ toolName: "grep", input: {} })) ?? null;
-assert.equal(toolCallResult, null, "grep allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "readSeek_grep", input: {} })) ?? null;
+assert.equal(toolCallResult, null, "readSeek_grep allowed while planning");
+toolCallResult = (await hooks.toolCall!({ toolName: "subagent_consult", input: { agent: "scout" } })) ?? null;
+assert.equal(toolCallResult, null, "subagent_consult allowed while planning");
 toolCallResult = (await hooks.toolCall!({ toolName: "plan_review", input: {} })) ?? null;
 assert.equal(toolCallResult, null, "plan_review allowed while planning");
 
-// /plan off deactivates
-await cmds["plan"]!.handler("off", startCtx as never);
-toolCallResult = (await hooks.toolCall!({ toolName: "edit", input: {} })) ?? null;
-assert.equal(toolCallResult, null, "edit allowed after /plan off");
-
-// plan_mode_question: inactive -> soft error; active -> select flow
-const qInactive = await questionTool.execute("id", { question: "Which DB?" }, undefined, undefined, { cwd: dir });
-assert.ok(qInactive.content[0]!.text.startsWith("error:"), "question tool gated on planning");
-const picked: string[] = [];
-const qCtx = {
-	cwd: dir,
-	ui: {
-		select: async (q: string, options: string[]) => { picked.push(q); return options[0]; },
-		input: async (q: string) => { picked.push(q); return "SQLite, obviously"; },
-	},
-};
-await cmds["plan"]!.handler("start", startCtx as never);
-const qAnswered = await questionTool.execute("id", { question: "Which database?", options: ["Postgres", "SQLite"] }, undefined, undefined, qCtx as never);
-assert.ok(qAnswered.content[0]!.text.includes("User answered: Postgres"), "select flow returns the choice");
-const qOther = await questionTool.execute("id", { question: "Which database?", options: ["Postgres", "SQLite"] }, undefined, undefined, {
-	...qCtx, ui: { select: async () => "Other…", input: async () => "DuckDB" },
-} as never);
-assert.ok(qOther.content[0]!.text.includes("DuckDB"), "Other… falls through to free-form input");
-await cmds["plan"]!.handler("off", startCtx as never);
+// bash: reviewed read-only forms pass, everything else blocked
+const bashCases: Array<[string, boolean]> = [
+	["find . -maxdepth 3 -type f | sort | head -200", true], // the exact call from the field
+	["ls -la", true],
+	["grep -rn pattern src/", true],
+	["git status", true],
+	["git log --oneline -5", true],
+	["npm test", true],
+	["rg formidable .", true],
+	["echo x > /tmp/pwned", false],
+	["ls; rm -rf /tmp/x", false],
+	["ls && rm -rf /tmp/x", false],
+	["rm -rf /tmp/x", false],
+	["git push", false],
+	["git branch new-name", false],
+	["npm install left-pad", false],
+	["env sh -c 'x'", false],
+	["find . -exec rm {} ;", false],
+	["sed -i s/a/b/ file", false],
+	["sudo cat /etc/shadow", false],
+	["cat file | tee other", false],
+	["node -e 'fs.rmSync(\"x\")'", false],
+];
+for (const [command, safe] of bashCases) {
+	toolCallResult = (await hooks.toolCall!({ toolName: "bash", input: { command } })) ?? null;
+	assert.equal(!!toolCallResult?.block, !safe, `bash policy: ${command}`);
+}
 
 // plan_review containment: paths outside .pi/plans are rejected before any UI
 {

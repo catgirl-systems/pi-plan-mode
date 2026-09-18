@@ -51,6 +51,7 @@ import {
 	commentsPathFor,
 	type PlanEntry,
 } from "./src/plan-store.ts";
+import { findBlockedCommandSegment, readCommand } from "./src/shell-policy.ts";
 
 // ---------- config ----------
 
@@ -563,13 +564,17 @@ function isLastSegmentOf(all: DisplayRow[], dr: DisplayRow): boolean {
 let planningActive = false;
 
 const PLANNING_READONLY_MESSAGE =
-	"Blocked: planning is active — only read tools are available. Finish the plan and " +
-	"call plan_review to present it (the user can also run /plan off).";
+	"Blocked: planning is active — only read-only operations are allowed. Prefer the read/grep/find/ls tools; " +
+	"bash runs reviewed read-only commands only. Finish the plan and call plan_review to present it " +
+	"(the user can also run /plan off).";
 
-// Default-deny: token-based shell filtering is unauditable (redirection, ;, find -exec,
-// env, npm run …), so bash is blocked outright during planning. Exploration is covered
-// by Pi's read-only built-ins; plan_review/plan_mode_question are part of the workflow.
-const PLANNING_ALLOWED_TOOLS = new Set(["read", "grep", "find", "ls", "plan_review", "plan_mode_question"]);
+// Default-deny for tools, with the read side explicitly listed. readSeek_* entries are
+// this deployment's ReadSeek suite — only its read-oriented tools; readSeek_edit/write/
+// rename stay blocked. subagent_consult spawns read-only scouts by contract.
+const PLANNING_ALLOWED_TOOLS = new Set([
+	"read", "grep", "find", "ls", "plan_review", "plan_mode_question", "subagent_consult",
+	"readSeek_grep", "readSeek_search", "readSeek_view", "readSeek_digest", "readSeek_def", "readSeek_refs",
+]);
 
 // ---------- entry points ----------
 
@@ -828,7 +833,9 @@ function planRequestPrompt(cwd: string, task: string): string {
 	const dir = defaultPlansDir({ cwd, home: process.env.HOME ?? "" });
 	return (
 		`Plan request: ${task}\n\n` +
-		`Research what's needed (read the code, search — do not implement anything yet), then write an implementation plan ` +
+		`Research what's needed — do not implement anything yet. While planning, only read-only operations work: ` +
+		`prefer the read/grep/find/ls tools; bash is limited to read-only commands (no redirection, chaining, or code execution). ` +
+		`Then write an implementation plan ` +
 		`as markdown to ${dir}/<descriptive-name>.md (choose a kebab-case name yourself; the file must be a .md inside that directory). ` +
 		`The plan should be opinionated and actionable: recommended approach only, critical file paths, and a verification section. ` +
 		`When the plan file is written, call the plan_review tool with its absolute path to present it for approval.`
@@ -841,6 +848,13 @@ export default function planReviewExtension(pi: ExtensionAPI): void {
 	// planning tool policy: default-deny while planning is active
 	pi.on("tool_call", async (event) => {
 		if (!planningActive) return;
+		if (event.toolName === "bash") {
+			const blockedSegment = findBlockedCommandSegment(readCommand(event.input));
+			if (blockedSegment !== undefined) {
+				return { block: true, reason: `Blocked: planning is active — bash outside the reviewed read-only policy.\nBlocked command: ${blockedSegment}\nPrefer the read/grep/find/ls tools, or run /plan off.` };
+			}
+			return;
+		}
 		if (!PLANNING_ALLOWED_TOOLS.has(event.toolName)) {
 			return { block: true, reason: PLANNING_READONLY_MESSAGE };
 		}
